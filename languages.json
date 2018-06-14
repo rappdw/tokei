@@ -977,6 +977,13 @@
                 "nix"
             ]
         },
+        "Notebook":{
+            "name":"Notebook",
+            "base":"blank",
+            "extensions":[
+                "ipynb"
+            ]
+        },
         "ObjectiveC":{
             "name":"Objective C",
             "base":"c",
