@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// A struct representing the statistics of a file.
 #[cfg_attr(feature = "io", derive(Deserialize, Serialize))]
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug)]
 pub struct Stats {
     /// Number of blank lines within the file.
     pub blanks: usize,
@@ -19,29 +19,14 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// Create a new `Stats` from a file path.
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    /// use tokei::Stats;
-    ///
-    /// let path = PathBuf::from("src/main.rs");
-    ///
-    /// let stats = Stats::new(path);
-    /// ```
+    /// Create a new `Stats` from a `ignore::DirEntry`.
     pub fn new(name: PathBuf) -> Self {
-        Stats { name: name, ..Self::default() }
-    }
-}
-
-impl Default for Stats {
-    fn default() -> Self {
         Stats {
-            name: PathBuf::new(),
-            lines: usize::default(),
-            code: usize::default(),
-            comments: usize::default(),
-            blanks: usize::default(),
+            blanks: 0,
+            code: 0,
+            comments: 0,
+            lines: 0,
+            name,
         }
     }
 }
@@ -56,14 +41,15 @@ fn find_char_boundary(s: &str, index: usize) -> usize {
 }
 
 macro_rules! display_stats {
-    ($f:expr, $this:expr, $name:expr) => {
+    ($f:expr, $this:expr, $name:expr, $max:expr) => {
         write!($f,
-               " {: <25} {:>12} {:>12} {:>12} {:>12}",
+               " {: <max$} {:>12} {:>12} {:>12} {:>12}",
                $name,
                $this.lines,
                $this.code,
                $this.comments,
-               $this.blanks)
+               $this.blanks,
+               max = $max)
     }
 }
 
@@ -72,13 +58,16 @@ impl fmt::Display for Stats {
         let name = self.name.to_string_lossy();
         let name_length = name.len();
 
-        if name_length == 25 || name_length <= 24 {
-            display_stats!(f, self, name)
+        let max_len = f.width().unwrap_or(25);
+
+        if name_length <= max_len {
+            display_stats!(f, self, name, max_len)
         } else {
             let mut formatted = String::from("|");
-            let from = find_char_boundary(&name, name_length - 24);
+            // Add 1 to the index to account for the '|' we add to the output string
+            let from = find_char_boundary(&name, name_length + 1 - max_len);
             formatted.push_str(&name[from..]);
-            display_stats!(f, self, formatted)
+            display_stats!(f, self, formatted, max_len)
         }
     }
 }

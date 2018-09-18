@@ -5,21 +5,24 @@
 #[macro_use] extern crate clap;
 extern crate env_logger;
 extern crate log;
+extern crate term_size;
 extern crate tokei;
 
 mod input;
 use input::*;
 
 use std::str::FromStr;
-use std::process;
+use std::{error::Error, process, io::{self, Write}};
 
 use tokei::{Languages, Language, LanguageType};
 use tokei::Sort;
 use input::Format;
 
 const FILES: &str = "files";
-const ROW: &str = "------------------------------------------------------------\
-                   -------------------";
+const FALLBACK_ROW_LEN: usize = 79;
+const NO_LANG_HEADER_ROW_LEN: usize = 67;
+const NO_LANG_ROW_LEN: usize = 61;
+const NO_LANG_ROW_LEN_NO_SPACES: usize = 54;
 
 fn crate_version() -> String {
     if Format::supported().is_empty() {
@@ -89,7 +92,7 @@ where T: FromStr,
     })
 }
 
-fn main() {
+fn main() -> Result<(), Box<Error>> {
     // Get options at the beginning, so the program doesn't have to make any
     // extra calls to get the information, and there isn't any magic strings.
 
@@ -110,11 +113,15 @@ fn main() {
         (@arg input:
             conflicts_with[languages] ...
             "The input file(s)/directory(ies) to be counted.")
+        (@arg types: -t --type
+            +takes_value
+            "Filters output by language type, seperated by a comma. i.e. -t=Rust,Markdown")
         (@arg languages: -l --languages
             conflicts_with[input]
             "Prints out supported languages and their extensions.")
         (@arg output: -o --output
-            possible_values(/* `all` is used so to fail later with a better error */Format::all())
+            // `all` is used so to fail later with a better error
+            possible_values(Format::all())
             +takes_value
             "Outputs Tokei in a specific format. Compile with additional features for more \
             format support.")
@@ -128,12 +135,13 @@ fn main() {
             +takes_value
             "Sort languages based on column")
     ).get_matches();
+
     let files_option = matches.is_present(FILES);
     let input_option = matches.value_of("file_input");
     let output_option = matches.value_of("output");
     let print_languages_option = matches.is_present("languages");
-    let verbose_option = matches.occurrences_of("verbose");
     let sort_option = matches.value_of("sort");
+    let verbose_option = matches.occurrences_of("verbose");
     let ignored_directories = {
         let mut ignored_directories: Vec<&str> = Vec::new();
         if let Some(user_ignored) = matches.values_of("exclude") {
@@ -169,22 +177,39 @@ fn main() {
         }
     }
 
-    languages.get_statistics(&paths, ignored_directories);
+    let types: Option<Vec<_>> = matches.value_of("types").map(|e| {
+        e.split(",")
+         .map(|t| t.parse::<LanguageType>())
+         .filter_map(Result::ok)
+         .collect()
+    });
+
+    languages.get_statistics(&paths, ignored_directories, types);
 
     if let Some(format) = output_format {
         print!("{}", format.print(languages).unwrap());
         process::exit(0);
     }
 
-    println!("{}", ROW);
-    println!(" {:<12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+    let columns = match term_size::dimensions() {
+        Some((columns, _)) => columns.max(FALLBACK_ROW_LEN),
+        None => FALLBACK_ROW_LEN,
+    };
+    let row = "-".repeat(columns);
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+
+    writeln!(stdout, "{}", row)?;
+    writeln!(stdout, " {:<6$} {:>12} {:>12} {:>12} {:>12} {:>12}",
                 "Language",
                 "Files",
                 "Lines",
                 "Code",
                 "Comments",
-                "Blanks");
-    println!("{}", ROW);
+                "Blanks",
+                columns - NO_LANG_HEADER_ROW_LEN)?;
+    writeln!(stdout, "{}", row)?;
 
     if let Some(sort_category) = sort_category {
         for (_, ref mut language) in &mut languages {
@@ -201,49 +226,68 @@ fn main() {
             Sort::Lines => languages.sort_by(|a, b| b.1.lines.cmp(&a.1.lines)),
         }
 
-        print_results(languages.into_iter(), files_option)
+        print_results(&mut stdout, &row, languages.into_iter(), files_option)?
     } else  {
-        print_results(languages.iter(), files_option)
+        print_results(&mut stdout, &row, languages.iter(), files_option)?
     }
 
     // If we're listing files there's already a trailing row so we don't want an extra one.
     if !files_option {
-        println!("{}", ROW);
+        writeln!(stdout, "{}", row)?;
     }
-    let mut total = Language::new_blank();
+
+    let mut total = Language::new();
+
     for (_, language) in languages {
         total += language;
     }
 
-    print_language(&total, "Total");
-    println!("{}", ROW);
+    print_language(&mut stdout, columns - NO_LANG_ROW_LEN, &total, "Total")?;
+    writeln!(stdout, "{}", row)?;
+
+    Ok(())
 }
 
-fn print_results<'a, I>(languages: I, list_files: bool)
-where I: std::iter::Iterator<Item = (&'a LanguageType, &'a Language)> {
+fn print_results<'a, I, W>(sink: &mut W, row: &str, languages: I, list_files: bool)
+    -> io::Result<()>
+    where I: Iterator<Item = (&'a LanguageType, &'a Language)>,
+          W: Write,
+{
+    let path_len = row.len() - NO_LANG_ROW_LEN_NO_SPACES;
+    let lang_section_len = row.len() - NO_LANG_ROW_LEN;
     for (name, language) in languages.filter(isnt_empty) {
-        print_language(language, name.name());
+        print_language(sink, lang_section_len, language, name.name())?;
 
         if list_files {
-            println!("{}", ROW);
+            writeln!(sink, "{}", row)?;
             for stat in &language.stats {
-                println!("{}", stat);
+                writeln!(sink, "{:1$}", stat, path_len)?;
             }
-            println!("{}", ROW);
+            writeln!(sink, "{}", row)?;
         }
     }
+
+    Ok(())
 }
 
 fn isnt_empty(&(_, language): &(&LanguageType, &Language)) -> bool {
     !language.is_empty()
 }
 
-fn print_language(language: &Language, name: &str) {
-    println!(" {: <18} {: >6} {:>12} {:>12} {:>12} {:>12}",
+fn print_language<W>(sink: &mut W,
+                     lang_section_len: usize,
+                     language: &Language,
+                     name: &str)
+    -> io::Result<()>
+    where W: Write,
+{
+    writeln!(sink,
+             " {:<len$} {:>6} {:>12} {:>12} {:>12} {:>12}",
              name,
              language.stats.len(),
              language.lines,
              language.code,
              language.comments,
-             language.blanks)
+             language.blanks,
+             len = lang_section_len)
 }

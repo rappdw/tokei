@@ -1,3 +1,20 @@
+# 8.0.0
+* A language's comments, and quotes are now available through the `LanguageType`
+  enum.
+* You can filter by language using the `-t/--type` option. e.g. `tokei -t "Rust,C"`
+  will print only Rust and C files.
+* Tokei now understands terminal width and will expand to fit it. (Thanks
+  to @Veykril)
+* Added [comparison](./COMPARISON.md) document to compare Tokei to other
+  code counters.
+* Updated dependencies
+
+**Added languages**
+- @BrandonBoone VB6, VBScript, XSLT
+- @ialpert BrightScript
+- @PJB3005 Dream Maker
+- @schmee edn
+
 # 7.0.3
 
 Made various optimisations, up to 65% faster in some cases.
