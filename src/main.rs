@@ -1,217 +1,75 @@
-// Copyright (c) 2015 Aaron Power
-// Use of this source code is governed by the MIT/APACHE2.0 license that can be
-// found in the LICENCE-{APACHE, MIT} file.
-
-#[macro_use] extern crate clap;
-extern crate env_logger;
-extern crate log;
-extern crate term_size;
-extern crate tokei;
-
+mod cli;
+mod cli_utils;
 mod input;
-use input::*;
 
-use std::str::FromStr;
 use std::{error::Error, process, io::{self, Write}};
 
-use tokei::{Languages, Language, LanguageType};
-use tokei::Sort;
-use input::Format;
-
-const FILES: &str = "files";
-const FALLBACK_ROW_LEN: usize = 79;
-const NO_LANG_HEADER_ROW_LEN: usize = 67;
-const NO_LANG_ROW_LEN: usize = 61;
-const NO_LANG_ROW_LEN_NO_SPACES: usize = 54;
-
-fn crate_version() -> String {
-    if Format::supported().is_empty() {
-        format!("{} compiled without serialization formats.", crate_version!())
-    } else {
-        format!(
-            "{} compiled with serialization support: {}",
-            crate_version!(),
-            Format::supported().join(", ")
-        )
-    }
-}
-
-fn setup_logger(verbose_option: u64) {
-    use log::LevelFilter;
-
-    let mut builder = env_logger::Builder::new();
-
-    let filter_level = match verbose_option {
-        1 => LevelFilter::Warn,
-        2 => LevelFilter::Debug,
-        3 => LevelFilter::Trace,
-        _ => LevelFilter::Error,
-    };
-
-    builder.filter(None, filter_level);
-    builder.init();
-}
-
-fn print_input_parse_failure(input_filename: &str) {
-    eprintln!("Error:\n Failed to parse input file: {}", input_filename);
-
-    let not_supported = input::Format::not_supported();
-    if !not_supported.is_empty() {
-        eprintln!("
-This version of tokei was compiled without serialization support for the following formats:
-
-    {not_supported}
-
-You may want to install any comma separated combination of {all:?}:
-
-    cargo install tokei --features {all:?}
-
-Or use the 'all' feature:
-
-    cargo install tokei --features all
-    \n",
-            not_supported = not_supported.join(", "),
-            // no space after comma to ease copypaste
-            all = self::Format::all_feature_names().join(",")
-        );
-    }
-}
-
-fn print_supported_languages() {
-    for key in LanguageType::list() {
-        println!("{:<25}", key);
-    }
-}
-
-fn parse_or_exit<T>(s: &str) -> T
-where T: FromStr,
-      T::Err: std::fmt::Display {
-    T::from_str(s).unwrap_or_else(|e| {
-        eprintln!("Error:\n{}", e);
-        std::process::exit(1);
-    })
-}
+use crate::cli::Cli;
+use crate::cli_utils::*;
+use crate::input::*;
+use tokei::{Language, Languages, Sort, Config};
 
 fn main() -> Result<(), Box<Error>> {
-    // Get options at the beginning, so the program doesn't have to make any
-    // extra calls to get the information, and there isn't any magic strings.
+    let mut cli = Cli::from_args();
+    let mut config = Config::from_config_files();
 
-    let matches = clap_app!(tokei =>
-        (version: &*crate_version())
-        (author: "Aaron P. <theaaronepower@gmail.com> + Contributors")
-        (about: crate_description!())
-        (@arg exclude: -e --exclude
-            +takes_value
-            +multiple number_of_values(1)
-            "Ignore all files & directories containing the word.")
-        (@arg file_input: -i --input
-            +takes_value
-            "Gives statistics from a previous tokei run. Can be given a file path, \
-            or \"stdin\" to read from stdin.")
-        (@arg files: -f --files
-            "Will print out statistics on individual files.")
-        (@arg input:
-            conflicts_with[languages] ...
-            "The input file(s)/directory(ies) to be counted.")
-        (@arg types: -t --type
-            +takes_value
-            "Filters output by language type, seperated by a comma. i.e. -t=Rust,Markdown")
-        (@arg languages: -l --languages
-            conflicts_with[input]
-            "Prints out supported languages and their extensions.")
-        (@arg output: -o --output
-            // `all` is used so to fail later with a better error
-            possible_values(Format::all())
-            +takes_value
-            "Outputs Tokei in a specific format. Compile with additional features for more \
-            format support.")
-        (@arg verbose: -v --verbose ...
-        "Set log output level:
-         1: to show unknown file extensions,
-         2: reserved for future debugging,
-         3: enable file level trace. Not recommended on multiple files")
-        (@arg sort: -s --sort
-            possible_values(&["files", "lines", "blanks", "code", "comments"])
-            +takes_value
-            "Sort languages based on column")
-    ).get_matches();
+    config.types = ::std::mem::replace(&mut cli.types, None).or(config.types);
 
-    let files_option = matches.is_present(FILES);
-    let input_option = matches.value_of("file_input");
-    let output_option = matches.value_of("output");
-    let print_languages_option = matches.is_present("languages");
-    let sort_option = matches.value_of("sort");
-    let verbose_option = matches.occurrences_of("verbose");
-    let ignored_directories = {
-        let mut ignored_directories: Vec<&str> = Vec::new();
-        if let Some(user_ignored) = matches.values_of("exclude") {
-            ignored_directories.extend(user_ignored);
-        }
-        ignored_directories
-    };
-
-    // Sorting category should be restricted by clap but parse before we do work just in case.
-    let sort_category = sort_option.map(parse_or_exit::<Sort>);
-    // Format category is overly accepting by clap (so the user knows what is supported)
-    // but this will fail if support is not compiled in and give a useful error to the user.
-    let output_format = output_option.map(parse_or_exit::<Format>);
-
-    setup_logger(verbose_option);
-
-    let mut languages = Languages::new();
-
-    if print_languages_option {
-        print_supported_languages();
+    if cli.print_languages {
+        Cli::print_supported_languages();
         process::exit(0);
     }
 
-    let paths: Vec<&str> = match matches.values_of("input") {
-        Some(vs) => vs.collect(),
-        None => vec!["."],
-    };
+    setup_logger(cli.verbose);
+    let mut languages = Languages::new();
 
-    if let Some(input) = input_option {
+    if let Some(input) = cli.file_input() {
         if !add_input(input, &mut languages) {
-            print_input_parse_failure(input);
+            Cli::print_input_parse_failure(input);
             process::exit(1);
         }
     }
 
-    let types: Option<Vec<_>> = matches.value_of("types").map(|e| {
-        e.split(",")
-         .map(|t| t.parse::<LanguageType>())
-         .filter_map(Result::ok)
-         .collect()
-    });
+    {
+        let input = cli.input();
 
-    languages.get_statistics(&paths, ignored_directories, types);
+        for path in &input {
+            if ::std::fs::metadata(path).is_err() {
+                eprintln!("Error: '{}' not found.", path);
+                process::exit(1);
+            }
+        }
 
-    if let Some(format) = output_format {
+        languages.get_statistics(&input, &cli.ignored_directories(), &config);
+    }
+
+    if let Some(format) = cli.output {
         print!("{}", format.print(languages).unwrap());
         process::exit(0);
     }
 
-    let columns = match term_size::dimensions() {
-        Some((columns, _)) => columns.max(FALLBACK_ROW_LEN),
-        None => FALLBACK_ROW_LEN,
-    };
+    let columns = cli.columns.or(config.columns).unwrap_or_else(|| {
+        if cli.files {
+            term_size::dimensions().map_or(FALLBACK_ROW_LEN, |(w, _)| {
+                w.max(FALLBACK_ROW_LEN)
+            })
+        } else {
+            FALLBACK_ROW_LEN
+        }
+    });
+
+
     let row = "-".repeat(columns);
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = io::BufWriter::new(io::stdout());
 
-    writeln!(stdout, "{}", row)?;
-    writeln!(stdout, " {:<6$} {:>12} {:>12} {:>12} {:>12} {:>12}",
-                "Language",
-                "Files",
-                "Lines",
-                "Code",
-                "Comments",
-                "Blanks",
-                columns - NO_LANG_HEADER_ROW_LEN)?;
-    writeln!(stdout, "{}", row)?;
+    if languages.iter().any(|(_, lang)| lang.inaccurate) {
+        print_inaccuracy_warning(&mut stdout)?;
+    }
 
-    if let Some(sort_category) = sort_category {
+    print_header(&mut stdout, &row, columns)?;
+
+    if let Some(sort_category) = cli.sort {
         for (_, ref mut language) in &mut languages {
             language.sort_by(sort_category)
         }
@@ -226,13 +84,14 @@ fn main() -> Result<(), Box<Error>> {
             Sort::Lines => languages.sort_by(|a, b| b.1.lines.cmp(&a.1.lines)),
         }
 
-        print_results(&mut stdout, &row, languages.into_iter(), files_option)?
+        print_results(&mut stdout, &row, languages.into_iter(), cli.files)?
     } else  {
-        print_results(&mut stdout, &row, languages.iter(), files_option)?
+        print_results(&mut stdout, &row, languages.iter(), cli.files)?
     }
 
-    // If we're listing files there's already a trailing row so we don't want an extra one.
-    if !files_option {
+    // If we're listing files there's already a trailing row so we don't want an
+    // extra one.
+    if !cli.files {
         writeln!(stdout, "{}", row)?;
     }
 
@@ -242,52 +101,8 @@ fn main() -> Result<(), Box<Error>> {
         total += language;
     }
 
-    print_language(&mut stdout, columns - NO_LANG_ROW_LEN, &total, "Total")?;
+    print_language(&mut stdout, columns, &total, "Total")?;
     writeln!(stdout, "{}", row)?;
 
     Ok(())
-}
-
-fn print_results<'a, I, W>(sink: &mut W, row: &str, languages: I, list_files: bool)
-    -> io::Result<()>
-    where I: Iterator<Item = (&'a LanguageType, &'a Language)>,
-          W: Write,
-{
-    let path_len = row.len() - NO_LANG_ROW_LEN_NO_SPACES;
-    let lang_section_len = row.len() - NO_LANG_ROW_LEN;
-    for (name, language) in languages.filter(isnt_empty) {
-        print_language(sink, lang_section_len, language, name.name())?;
-
-        if list_files {
-            writeln!(sink, "{}", row)?;
-            for stat in &language.stats {
-                writeln!(sink, "{:1$}", stat, path_len)?;
-            }
-            writeln!(sink, "{}", row)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn isnt_empty(&(_, language): &(&LanguageType, &Language)) -> bool {
-    !language.is_empty()
-}
-
-fn print_language<W>(sink: &mut W,
-                     lang_section_len: usize,
-                     language: &Language,
-                     name: &str)
-    -> io::Result<()>
-    where W: Write,
-{
-    writeln!(sink,
-             " {:<len$} {:>6} {:>12} {:>12} {:>12} {:>12}",
-             name,
-             language.stats.len(),
-             language.lines,
-             language.code,
-             language.comments,
-             language.blanks,
-             len = lang_section_len)
 }

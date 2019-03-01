@@ -1,7 +1,3 @@
-// Copyright (c) 2015 Aaron Power
-// Use of this source code is governed by the APACHE2.0/MIT licence that can be
-// found in the LICENCE-{APACHE/MIT} file.
-
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::Path;
@@ -14,13 +10,14 @@ use ignore::WalkState::*;
 use rayon::prelude::*;
 
 // This is just a re-export from the auto generated file.
-pub use language::get_filetype_from_shebang;
-use language::{Language, LanguageType};
+pub use crate::language::get_filetype_from_shebang;
+use crate::language::{Language, LanguageType};
+use crate::config::Config;
 
-pub fn get_all_files(paths: &[&str],
-                     ignored_directories: Vec<&str>,
+pub fn get_all_files<A: AsRef<Path>>(paths: &[A],
+                     ignored_directories: &[&str],
                      languages: &mut BTreeMap<LanguageType, Language>,
-                     types: Option<Vec<LanguageType>>)
+                     config: &Config)
 {
     let (tx, rx) = mpsc::channel();
 
@@ -44,10 +41,16 @@ pub fn get_all_files(paths: &[&str],
     walker.build_parallel().run(move|| {
         let tx = tx.clone();
         Box::new(move |entry| {
-
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
+                    use ignore::Error;
+                    if let Error::WithDepth { err: ref error, .. } = error {
+                        if let Error::WithPath { ref path, err: ref error } = **error {
+                            error!("{} reading {}", error.description(), path.display());
+                            return Continue;
+                        }
+                    }
                     error!("{}", error.description());
                     return Continue;
                 }
@@ -63,59 +66,50 @@ pub fn get_all_files(paths: &[&str],
         })
     });
 
-    let types: Option<&[LanguageType]> = types.as_ref().map(|v| &**v);
+    let types: Option<&[LanguageType]> = config.types.as_ref().map(|v| &**v);
 
-    let iter: Vec<_> = rx.into_iter()
+    let iter = rx.into_iter()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .filter_map(|entry| {
-            if let Some(language) = LanguageType::from_path(entry.path()) {
-                if (types.is_some() &&
-                    types.map(|t| t.contains(&language)).unwrap()) ||
-                    types.is_none()
-                {
-                    return language.parse(entry)
-                        .ok()
-                        .and_then(|s| Some((language, s)))
-                }
-            }
-
-            None
-    }).collect();
+        .filter_map(|e| LanguageType::from_path(e.path(), &config).map(|l| (e, l)))
+        .filter(|(_, l)| types.map(|t| t.contains(l)).unwrap_or(true))
+        .map(|(entry, language)| {
+            language.parse(entry.into_path(), &config)
+                .map(|stats| (language, Some(stats)))
+                .unwrap_or_else(|(e, path)| {
+                    error!("{} reading {}", e.description(), path.display());
+                    (language, None)
+                })
+        })
+        .collect::<Vec<_>>();
 
     for (language_type, stats) in iter {
-        languages.entry(language_type)
-            .or_insert_with(|| Language::new())
-            .add_stat(stats);
+        let entry = languages.entry(language_type).or_insert_with(Language::new);
+
+        if let Some(stats) = stats {
+            entry.add_stat(stats);
+        } else {
+            entry.mark_inaccurate();
+        }
     }
 }
 
 pub(crate) fn get_extension(path: &Path) -> Option<String> {
-    match path.extension() {
-        Some(extension_os) => {
-            Some(extension_os.to_string_lossy().to_lowercase())
-        },
-        None => None
-    }
+    path.extension().map(|e| e.to_string_lossy().to_lowercase())
 }
 
 pub(crate) fn get_filename(path: &Path) -> Option<String> {
-    match path.file_name() {
-        Some(filename_os) => {
-            Some(filename_os.to_string_lossy().to_lowercase())
-        },
-        None => None
-    }
+    path.file_name().map(|e| e.to_string_lossy().to_lowercase())
 }
 
 #[cfg(test)]
 mod test {
-    extern crate tempdir;
-    use super::*;
     use std::fs::create_dir;
-    use language::languages::Languages;
-    use language::LanguageType;
-    use self::tempdir::TempDir;
+
+    use tempdir::TempDir;
+
+    use crate::{config::Config, language::{LanguageType, languages::Languages}};
+    use super::*;
 
     #[test]
     fn walker_directory_as_file() {
@@ -123,9 +117,12 @@ mod test {
         let path_name = tmp_dir.path().join("directory.rs");
         create_dir(&path_name).expect("Couldn't create directory.rs within temp");
 
-        let mut l = Languages::new();
-        get_all_files(&[tmp_dir.into_path().to_str().unwrap()], vec![], &mut l, None);
+        let mut languages = Languages::new();
+        get_all_files(&[tmp_dir.into_path().to_str().unwrap()],
+                      &[],
+                      &mut languages,
+                      &Config::default());
 
-        assert!(l.get(&LanguageType::Rust).is_none());
+        assert!(languages.get(&LanguageType::Rust).is_none());
     }
 }
